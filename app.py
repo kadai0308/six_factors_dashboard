@@ -5,6 +5,7 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, timedelta
+import time
 
 # --- Configuration ---
 FACTOR_TICKERS = {
@@ -42,24 +43,45 @@ def setup_page():
 
 # --- Data Fetching ---
 @st.cache_data(ttl=3600*12)  # Cache for 12 hours
-def fetch_data(tickers, lookback_years=2):
+def fetch_data(tickers, lookback_years=1):
     """
     Fetch Adjusted Close data for the given tickers.
     """
     end_date = datetime.today()
     start_date = end_date - timedelta(days=lookback_years * 365 + 30) # Buffer for rolling windows
     
-    try:
-        data = yf.download(tickers, start=start_date, end=end_date, progress=False)
-        # Check if 'Adj Close' exists, otherwise use 'Close'
-        if 'Adj Close' in data.columns.get_level_values(0):
-            data = data['Adj Close']
-        elif 'Close' in data.columns.get_level_values(0):
-            data = data['Close']
-        else:
-            st.error("Could not find 'Adj Close' or 'Close' in data.")
+    session = None # Removed LimiterSession
+    
+    # helper for rate limiting
+    def batch_fetch(tickers, batch_size=2, delay=1.0):
+        all_data = []
+        for i in range(0, len(tickers), batch_size):
+            batch = tickers[i:i+batch_size]
+            try:
+                # threads=True is fine within a batch, we limit batch rate
+                b_data = yf.download(batch, start=start_date, end=end_date, progress=False, threads=True)
+                
+                if not b_data.empty:
+                    if 'Adj Close' in b_data.columns.get_level_values(0):
+                        b_data = b_data['Adj Close']
+                    elif 'Close' in b_data.columns.get_level_values(0):
+                        b_data = b_data['Close']
+                    all_data.append(b_data)
+            except Exception as e:
+                st.error(f"Error fetching batch {batch}: {e}")
+            
+            time.sleep(delay)
+            
+        if not all_data:
             return pd.DataFrame()
             
+        return pd.concat(all_data, axis=1)
+
+    try:
+        # data = yf.download(tickers, start=start_date, end=end_date, progress=False, session=session)
+        # Replaced with batch fetch
+        data = batch_fetch(tickers)
+        
         # Forward fill and drop NaNs to ensure clean data
         data = data.ffill().dropna()
         return data
