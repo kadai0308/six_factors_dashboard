@@ -6,6 +6,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, timedelta
 import time
+import os
 
 # --- Configuration ---
 FACTOR_TICKERS = {
@@ -42,52 +43,183 @@ def setup_page():
     """, unsafe_allow_html=True)
 
 # --- Data Fetching ---
+# --- Data Fetching ---
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+
 @st.cache_data(ttl=3600*12)  # Cache for 12 hours
-def fetch_data(tickers, lookback_years=1):
+def fetch_data(tickers, lookback_years=2):
     """
     Fetch Adjusted Close data for the given tickers.
+    Uses local CSV caching:
+    - Checks data/{ticker}.csv
+    - If exists, fetches only new data since last date in CSV.
+    - If not exists, fetches full history.
     """
+    if not os.path.exists(DATA_DIR):
+        os.makedirs(DATA_DIR)
+        
     end_date = datetime.today()
-    start_date = end_date - timedelta(days=lookback_years * 365 + 30) # Buffer for rolling windows
+    # Ensure end_date includes today by setting time to end of day? 
+    # yfinance usually handles "today" implies up to now or last close.
+    # Let's keep strict date objects for comparison to ease logic.
+    today_date = end_date.date()
     
-    session = None # Removed LimiterSession
+    global_start_date = end_date - timedelta(days=lookback_years * 365 + 30) # Buffer
     
-    # helper for rate limiting
-    def batch_fetch(tickers, batch_size=2, delay=1.0):
-        all_data = []
-        for i in range(0, len(tickers), batch_size):
-            batch = tickers[i:i+batch_size]
+    # 1. Determine fetch requirements per ticker
+    fetch_plan = {} # start_date -> [tickers]
+    existing_data = {} # ticker -> dataframe
+    
+    for ticker in tickers:
+        file_path = os.path.join(DATA_DIR, f"{ticker}.csv")
+        start_date = global_start_date
+        
+        if os.path.exists(file_path):
             try:
-                # threads=True is fine within a batch, we limit batch rate
-                b_data = yf.download(batch, start=start_date, end=end_date, progress=False, threads=True)
+                # Read CSV
+                df = pd.read_csv(file_path, index_col=0, parse_dates=True)
+                
+                # Standardize column name internally to ticker for compatibility
+                if 'adj_close' in df.columns:
+                    df = df.rename(columns={'adj_close': ticker})
+                elif len(df.columns) == 1:
+                     # Fallback if migration hasn't happened yet for some reason
+                     df.columns = [ticker]
+                
+                existing_data[ticker] = df
+                
+                if not df.empty:
+                    last_date = df.index[-1].date()
+                    if last_date < today_date:
+                         # Need new data from last_date + 1 day
+                         # BUT if last_date + 1 == today, and market is open/closed, we try to fetch today.
+                         # If today is weekend or no data out yet, yf might fail or return empty.
+                         start_date_candidate = datetime.combine(last_date + timedelta(days=1), datetime.min.time())
+                         # Only fetch if start_date <= today. (Equality means we try to fetch today's data)
+                         if start_date_candidate.date() <= today_date:
+                            start_date = start_date_candidate
+                         else:
+                            continue
+                    else:
+                        # Up to date
+                        continue 
+            except Exception as e:
+                st.error(f"Error reading {file_path}: {e}")
+                # Fallback to full download
+                existing_data.pop(ticker, None)
+        
+        # Add to fetch plan
+        # We use strict timestamp for Grouping
+        # If start_date is datetime, use it. if it's based on lookback (which is datetime), ok.
+        
+        # Fix: ensure start_date is datetime object for grouping
+        if isinstance(start_date, datetime):
+            s_key = start_date
+        else:
+             # Should be datetime based on logic above
+             s_key = start_date
+             
+        if s_key not in fetch_plan:
+            fetch_plan[s_key] = []
+        fetch_plan[s_key].append(ticker)
+
+    # 2. Fetch Data in Groups
+    # Refactored batch fetcher that takes specific list
+    
+    for start_dt, group_tickers in fetch_plan.items():
+        # Rate limit per batch of 2 within the group
+        batch_size = 2
+        delay = 1.0
+        
+        for i in range(0, len(group_tickers), batch_size):
+            batch = group_tickers[i:i+batch_size]
+            try:
+                # Check if start_dt is in future or today?
+                if start_dt.date() > today_date:
+                    continue
+                    
+                # yf.download
+                # Note: start is inclusive.
+                b_data = yf.download(batch, start=start_dt, end=end_date, progress=False, threads=True)
                 
                 if not b_data.empty:
+                    # Clean data structure
                     if 'Adj Close' in b_data.columns.get_level_values(0):
-                        b_data = b_data['Adj Close']
+                         process_df = b_data['Adj Close']
                     elif 'Close' in b_data.columns.get_level_values(0):
-                        b_data = b_data['Close']
-                    all_data.append(b_data)
+                         process_df = b_data['Close']
+                    else:
+                        # If single ticker result, columns are not MultiIndex in same way usually?
+                        # yfinance usually returns MultiIndex if list passed, even size 1?
+                        # If size 1, it might just be columns: Open, High... 
+                        # Let's standardize.
+                        if len(batch) == 1:
+                            # It returns DataFrame with columns Open, Close etc.
+                             if 'Adj Close' in b_data.columns:
+                                 process_df = pd.DataFrame({batch[0]: b_data['Adj Close']})
+                             elif 'Close' in b_data.columns:
+                                 process_df = pd.DataFrame({batch[0]: b_data['Close']})
+                             else:
+                                 process_df = pd.DataFrame()
+                        else:
+                             # MultiIndex case (handled above mostly, but double check)
+                             process_df = pd.DataFrame() # Should have been caught by if 'Adj Close' check?
+                             # Re-eval:
+                             if isinstance(b_data.columns, pd.MultiIndex):
+                                  if 'Adj Close' in b_data.columns.get_level_values(0):
+                                       process_df = b_data['Adj Close']
+                                  elif 'Close' in b_data.columns.get_level_values(0):
+                                       process_df = b_data['Close']
+                             else:
+                                  # Should not happen with list input unless flattened?
+                                  st.write(f"Unexpected columns for {batch}: {b_data.columns}")
+                                  continue
+
+                    # Update CSVs
+                    for t in batch:
+                        if t in process_df.columns:
+                            new_series = process_df[t].dropna()
+                            if not new_series.empty:
+                                new_df = pd.DataFrame(new_series)
+                                new_df.columns = [t]
+                                
+                                # Combine with existing
+                                if t in existing_data:
+                                    # Append
+                                    combined = pd.concat([existing_data[t], new_df])
+                                    combined = combined[~combined.index.duplicated(keep='last')]
+                                    existing_data[t] = combined
+                                else:
+                                    existing_data[t] = new_df
+                                    
+                                # Save with generic format
+                                save_df = existing_data[t].copy()
+                                save_df.columns = ['adj_close']
+                                save_df.index.name = 'date'
+                                
+                                file_path = os.path.join(DATA_DIR, f"{t}.csv")
+                                save_df.to_csv(file_path)
+                                
             except Exception as e:
                 st.error(f"Error fetching batch {batch}: {e}")
             
             time.sleep(delay)
-            
-        if not all_data:
-            return pd.DataFrame()
-            
-        return pd.concat(all_data, axis=1)
 
-    try:
-        # data = yf.download(tickers, start=start_date, end=end_date, progress=False, session=session)
-        # Replaced with batch fetch
-        data = batch_fetch(tickers)
-        
-        # Forward fill and drop NaNs to ensure clean data
-        data = data.ffill().dropna()
-        return data
-    except Exception as e:
-        st.error(f"Error fetching data: {e}")
+    # 3. Assemble Final DataFrame
+    final_df_list = []
+    for t in tickers:
+        if t in existing_data:
+            # Rename column to t if not already (it should be)
+            d = existing_data[t]
+            # Ensure column is named t
+            if d.shape[1] == 1:
+                d.columns = [t]
+            final_df_list.append(d)
+            
+    if not final_df_list:
         return pd.DataFrame()
+        
+    return pd.concat(final_df_list, axis=1).ffill().dropna()
 
 # --- Calculations ---
 def calculate_momentum(df, window_12m_exclude=21):
